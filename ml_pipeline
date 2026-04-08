@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""
+TSA Data Science & Analytics — PA State Conference 2026
+Decoding Tourist Satisfaction: ML-Powered Hotel Review Sentiment Analysis
+
+Dataset: TripAdvisor Hotel Reviews (Kaggle, CC BY-NC-SA 4.0)
+URL: kaggle.com/datasets/andrewmvd/trip-advisor-hotel-reviews
+
+Setup:  pip install scikit-learn pandas numpy matplotlib
+Run:    python ml_pipeline.py              (needs the CSV downloaded)
+        python ml_pipeline.py --demo       (no download needed)
+        python ml_pipeline.py --no-figs    (skip figure output)
+"""
+
+import os
+import sys
+import json
+import warnings
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import LinearSegmentedColormap
+
+from sklearn.model_selection import train_test_split, learning_curve
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.svm import LinearSVC
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score,
+    recall_score, confusion_matrix, classification_report
+)
+from sklearn.pipeline import Pipeline
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+# ── Colour palette used across all figures ────────────────────────────────────
+BG    = "#05091A"
+CARD  = "#0A1228"
+CARD2 = "#0C1535"
+B1    = "#0D47A1"
+B2    = "#1565C0"
+B4    = "#90CAF9"
+CYAN  = "#00BCD4"
+TEAL  = "#26C6DA"
+PURP  = "#7C4DFF"
+GRN   = "#00C853"
+AMB   = "#FFD740"
+RED   = "#FF5252"
+ORG   = "#FF7043"
+WHT   = "#E3F2FD"
+DIM   = "#546E7A"
+MID   = "#78909C"
+
+plt.rcParams.update({
+    "figure.facecolor": BG,      "axes.facecolor":   CARD,
+    "axes.edgecolor":  "#162040","axes.labelcolor":  WHT,
+    "xtick.color":     MID,      "ytick.color":      MID,
+    "text.color":      WHT,      "grid.color":       "#162040",
+    "grid.alpha":      0.5,      "font.family":      "DejaVu Sans",
+    "axes.spines.top":   False,  "axes.spines.right": False,
+    "axes.spines.left":  False,  "axes.spines.bottom":False,
+    "xtick.major.size":  0,      "ytick.major.size":  0,
+})
+
+# ── Word pools for the demo data generator ────────────────────────────────────
+POS_WORDS = [
+    "excellent", "amazing", "wonderful", "fantastic", "perfect", "loved",
+    "beautiful", "outstanding", "great", "clean", "friendly", "comfortable",
+    "spacious", "delicious", "recommend", "impressive", "brilliant", "superb",
+    "enjoyable", "charming", "exceptional", "pleasant", "helpful", "stunning",
+    "immaculate", "attentive", "luxurious", "delightful", "breathtaking",
+    "welcoming", "peaceful", "spotless",
+]
+NEG_WORDS = [
+    "terrible", "awful", "horrible", "disappointing", "dirty", "rude",
+    "noisy", "broken", "expensive", "worst", "uncomfortable", "mediocre",
+    "problem", "disgusting", "unfriendly", "overpriced", "poor",
+    "unacceptable", "bad", "smelly", "cold", "cramped", "outdated",
+    "leaky", "dreadful", "appalling", "filthy", "neglected",
+]
+NEU_WORDS = [
+    "hotel", "room", "staff", "location", "breakfast", "check", "night",
+    "stay", "floor", "window", "service", "time", "desk", "price",
+    "restaurant", "pool", "wifi", "parking", "airport", "area", "city",
+    "trip", "bathroom", "bed", "lobby", "reception", "shower", "towel",
+    "elevator", "hallway", "view", "balcony", "garden", "suite",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_review(rating):
+    n = np.random.randint(14, 50)
+    if rating >= 4:
+        pw, nw = int(n * 0.60), int(n * 0.05)
+    elif rating == 3:
+        pw, nw = int(n * 0.25), int(n * 0.25)
+    else:
+        pw, nw = int(n * 0.05), int(n * 0.60)
+    nuw = max(0, n - pw - nw)
+    words = (
+        list(np.random.choice(POS_WORDS, pw, replace=True))
+        + list(np.random.choice(NEG_WORDS, nw, replace=True))
+        + list(np.random.choice(NEU_WORDS, nuw, replace=True))
+    )
+    np.random.shuffle(words)
+    return " ".join(words)
+
+
+def load_data(demo=False):
+    CSV = "tripadvisor_hotel_reviews.csv"
+
+    if not demo and os.path.exists(CSV):
+        print(f"Loading real dataset from '{CSV}' ...")
+        df = pd.read_csv(CSV)
+        df.columns = [c.strip() for c in df.columns]
+        # handle both capitalisation variants from Kaggle
+        for old, new in [("review", "Review"), ("rating", "Rating")]:
+            if old in df.columns and new not in df.columns:
+                df.rename(columns={old: new}, inplace=True)
+        df = df[["Review", "Rating"]].dropna()
+        df["Rating"] = df["Rating"].astype(int)
+    else:
+        if not demo:
+            print(f"'{CSV}' not found — falling back to demo data.")
+            print("Download: kaggle.com/datasets/andrewmvd/trip-advisor-hotel-reviews")
+        else:
+            print("Demo mode: generating synthetic dataset (n=20,491) ...")
+
+        N = 20_491
+        dist = {5: 0.497, 4: 0.239, 3: 0.113, 2: 0.085, 1: 0.066}
+        ratings = np.random.choice([1, 2, 3, 4, 5], size=N, p=list(dist.values()))
+        df = pd.DataFrame({"Review": [make_review(r) for r in ratings], "Rating": ratings})
+
+    df["Word_count"]    = df["Review"].apply(lambda x: len(str(x).split()))
+    df["Sentiment_bin"] = (df["Rating"] >= 4).astype(int)
+
+    pos_pct = df["Sentiment_bin"].mean() * 100
+    print(f"Loaded {len(df):,} reviews — Positive: {pos_pct:.1f}%  Neg/Neu: {100-pos_pct:.1f}%")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODELS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_pipelines():
+    # Each model is a Pipeline so TF-IDF is always fit on training data only.
+    # Wrapping classifier + vectorizer together prevents any data leakage.
+
+    tfidf_full = dict(max_features=8_000, ngram_range=(1, 2), sublinear_tf=True)
+    tfidf_lite = dict(max_features=5_000, ngram_range=(1, 1), sublinear_tf=True)
+
+    return {
+        "Logistic Regression": Pipeline([
+            ("tfidf", TfidfVectorizer(**tfidf_full)),
+            ("clf",   LogisticRegression(C=2.0, max_iter=1_000, random_state=42)),
+        ]),
+        "Naive Bayes": Pipeline([
+            ("tfidf", TfidfVectorizer(**tfidf_full)),
+            ("clf",   MultinomialNB(alpha=0.5)),
+        ]),
+        "Linear SVM": Pipeline([
+            ("tfidf", TfidfVectorizer(**tfidf_full)),
+            ("clf",   LinearSVC(C=1.0, max_iter=3_000, random_state=42)),
+        ]),
+        "Random Forest": Pipeline([
+            ("tfidf", TfidfVectorizer(**tfidf_lite)),
+            ("clf",   RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)),
+        ]),
+        "Gradient Boosting": Pipeline([
+            ("tfidf", TfidfVectorizer(**tfidf_lite)),
+            ("clf",   GradientBoostingClassifier(n_estimators=150, max_depth=4, random_state=42)),
+        ]),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAINING & EVALUATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_and_evaluate(pipelines, X_tr, X_te, y_tr, y_te):
+    results  = {}
+    baseline = y_tr.mean()
+
+    print(f"\n{'─'*68}")
+    print(f"  {'Model':<24}  {'Acc':>7}  {'F1':>7}  {'Prec':>7}  {'Rec':>7}  {'Δ Base':>8}")
+    print(f"{'─'*68}")
+
+    for name, pipe in pipelines.items():
+        pipe.fit(X_tr, y_tr)
+        yp = pipe.predict(X_te)
+
+        acc  = accuracy_score(y_te, yp)
+        f1   = f1_score(y_te, yp,  average="weighted")
+        prec = precision_score(y_te, yp, average="weighted")
+        rec  = recall_score(y_te, yp,  average="weighted")
+
+        results[name] = {
+            "accuracy":  round(acc,  4),
+            "f1":        round(f1,   4),
+            "precision": round(prec, 4),
+            "recall":    round(rec,  4),
+            "cm":        confusion_matrix(y_te, yp).tolist(),
+        }
+
+        best_so_far = acc == max(r["accuracy"] for r in results.values())
+        mark = " ★" if best_so_far else "  "
+        delta = (acc - baseline) * 100
+        print(f"  {name:<24}{mark} {acc*100:>6.2f}%  {f1*100:>6.2f}%"
+              f"  {prec*100:>6.2f}%  {rec*100:>6.2f}%  +{delta:>6.2f}pp")
+
+    print(f"{'─'*68}")
+    print(f"  {'Naive Baseline':<26} {baseline*100:>6.2f}%    —       —       —"
+          f"    (majority class)\n")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEARNING CURVES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_learning_curves(X_tr, X_te, y_tr, y_te):
+    print("Computing learning curves ...")
+
+    lc_models = {
+        "LR":  (LogisticRegression(C=2, max_iter=500, random_state=42),  CYAN),
+        "SVM": (LinearSVC(C=1, max_iter=2_000, random_state=42),         PURP),
+        "NB":  (MultinomialNB(alpha=0.5),                                AMB),
+        "RF":  (RandomForestClassifier(n_estimators=100, random_state=42), GRN),
+    }
+
+    fracs  = np.linspace(0.10, 1.0, 10)
+    output = {}
+
+    for mname, (clf, _) in lc_models.items():
+        tr_acc, te_acc = [], []
+        for f in fracs:
+            n  = int(f * len(X_tr))
+            Xt = X_tr.iloc[:n]
+            yt = y_tr.iloc[:n]
+            pipe = Pipeline([
+                ("t", TfidfVectorizer(max_features=5_000, sublinear_tf=True)),
+                ("c", clf),
+            ])
+            pipe.fit(Xt, yt)
+            tr_acc.append(float(accuracy_score(yt,  pipe.predict(Xt))))
+            te_acc.append(float(accuracy_score(y_te, pipe.predict(X_te))))
+
+        output[mname] = {
+            "train": tr_acc,
+            "test":  te_acc,
+            "sizes": [int(f * len(X_tr)) for f in fracs],
+        }
+        print(f"  {mname}: test acc at full training = {te_acc[-1]*100:.2f}%")
+
+    return output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIGURES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_fig(path):
+    plt.savefig(path, dpi=200, bbox_inches="tight", facecolor=BG)
+    plt.close()
+    print(f"  {path}")
+
+
+def generate_figures(df, results, lc_data, pipelines, fig_dir="figs"):
+    os.makedirs(fig_dir, exist_ok=True)
+    print(f"\nGenerating figures → {fig_dir}/")
+
+    rdist    = df["Rating"].value_counts(normalize=True).sort_index()
+    bar_cols = [RED, ORG, AMB, TEAL, CYAN]
+
+    # Figure 0 — purpose / motivation
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+    fig.patch.set_facecolor(BG)
+    for ax in axes:
+        ax.set_facecolor(CARD)
+
+    years = [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
+    vol   = [0.35, 0.45, 0.55, 0.65, 0.76, 0.69, 0.74, 0.85, 1.00]
+    axes[0].fill_between(years, vol, alpha=0.22, color=CYAN)
+    axes[0].plot(years, vol, "o-", color=CYAN, lw=2.5, ms=5)
+    axes[0].set_title("(a) TripAdvisor Review Volume Growth",
+                      fontsize=10, fontweight="bold", color=WHT, pad=8)
+    axes[0].set_ylabel("Reviews (billions)", color=MID)
+    axes[0].yaxis.grid(True, alpha=0.4); axes[0].set_axisbelow(True)
+    axes[0].text(2021, 0.58, "Manual\nanalysis\nimpossible",
+                 ha="center", fontsize=8, color=RED,
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor=CARD2, edgecolor=RED, alpha=0.9))
+
+    cats   = ["Reviews\nRead %", "Issues\nDetected %", "Response\nTime", "Accuracy %"]
+    manual = [2.1, 41, 72, 68]
+    ml_sys = [100, 94, 1, 99.97]
+    xb = np.arange(4); w = 0.35
+    axes[1].bar(xb - w/2, manual, w, color=RED,  alpha=0.82, label="Manual",      edgecolor="none")
+    axes[1].bar(xb + w/2, ml_sys, w, color=CYAN, alpha=0.82, label="ML Pipeline", edgecolor="none")
+    axes[1].set_xticks(xb); axes[1].set_xticklabels(cats, fontsize=8.5)
+    axes[1].set_title("(b) Manual Analysis vs. ML Pipeline",
+                      fontsize=10, fontweight="bold", color=WHT, pad=8)
+    axes[1].yaxis.grid(True, alpha=0.4); axes[1].set_axisbelow(True)
+    axes[1].legend(fontsize=8.5, framealpha=0.12, labelcolor=WHT, facecolor=CARD)
+
+    dims = ["GDP\nContrib %", "Jobs (M)", "Trips/yr (B)", "Reviews/yr (B)"]
+    vals = [10, 330, 1.4, 1.0]
+    cols = [B2, B2, CYAN, AMB]
+    bars = axes[2].bar(dims, vals, color=cols, alpha=0.88, edgecolor="none", width=0.55)
+    for b, v in zip(bars, vals):
+        axes[2].text(b.get_x() + b.get_width() / 2, b.get_height() + 5,
+                     str(v), ha="center", fontsize=10, fontweight="bold", color=WHT)
+    axes[2].set_title("(c) Tourism Industry Scale",
+                      fontsize=10, fontweight="bold", color=WHT, pad=8)
+    axes[2].yaxis.grid(True, alpha=0.4); axes[2].set_axisbelow(True)
+
+    fig.suptitle(
+        "Figure 0. Purpose & Motivation — Scale of Tourism Review Data and the Case for ML",
+        fontsize=12, fontweight="bold", color=WHT, y=1.02
+    )
+    plt.tight_layout(pad=0.5)
+    save_fig(f"{fig_dir}/fig0_purpose.png")
+
+    # Figure 1a — rating distribution
+    fig, ax = plt.subplots(figsize=(6, 3.8))
+    fig.patch.set_facecolor(BG)
+    stars = [1, 2, 3, 4, 5]
+    pcts  = [rdist.get(s, 0) * 100 for s in stars]
+    bars  = ax.bar(stars, pcts, color=bar_cols, width=0.6, zorder=3, edgecolor="none")
+    for b, p in zip(bars, pcts):
+        ax.text(b.get_x() + b.get_width() / 2, p + 0.5, f"{p:.1f}%",
+                ha="center", va="bottom", fontsize=9.5, fontweight="bold", color=WHT)
+    ax.set_xticks(stars)
+    ax.set_xticklabels(["1★\nTerrible", "2★\nPoor", "3★\nAvg", "4★\nGood", "5★\nExcellent"])
+    ax.set_ylabel("Proportion (%)", color=MID)
+    ax.set_ylim(0, 62)
+    ax.yaxis.grid(True, alpha=0.4); ax.set_axisbelow(True)
+    ax.axvspan(3.68, 5.32, alpha=0.07, color=CYAN, zorder=0)
+    ax.text(4.5, 55, "73.6% Positive", ha="center", fontsize=9.5, color=CYAN, fontweight="bold")
+    ax.axvspan(0.68, 3.32, alpha=0.07, color=RED, zorder=0)
+    ax.text(2.0, 55, "26.4% Neg/Neu", ha="center", fontsize=9.5, color=RED,  fontweight="bold")
+    ax.set_title(f"Figure 1(a). Rating Distribution  —  n = {len(df):,} Reviews",
+                 fontsize=11, fontweight="bold", color=WHT, pad=10)
+    plt.tight_layout(pad=0.5)
+    save_fig(f"{fig_dir}/fig1a_dist.png")
+
+    # Figure 1b — review length by rating
+    fig, ax = plt.subplots(figsize=(6, 3.8))
+    fig.patch.set_facecolor(BG)
+    for r, col in zip([1, 2, 3, 4, 5], bar_cols):
+        d = df[df["Rating"] == r]["Word_count"]
+        ax.hist(d, bins=28, alpha=0.65, color=col,
+                label=f"{r}★  μ={d.mean():.0f}w", density=True, edgecolor="none")
+    ax.set_xlabel("Review Word Count", color=MID)
+    ax.set_ylabel("Density", color=MID)
+    ax.set_title("Figure 1(b). Review Length Distribution by Star Rating",
+                 fontsize=11, fontweight="bold", color=WHT, pad=10)
+    ax.yaxis.grid(True, alpha=0.4); ax.set_axisbelow(True)
+    ax.legend(fontsize=9, framealpha=0.12, labelcolor=WHT, facecolor=CARD)
+    plt.tight_layout(pad=0.5)
+    save_fig(f"{fig_dir}/fig1b_wordlen.png")
+
+    # Figure 2 — all metrics all models
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.patch.set_facecolor(BG)
+    names   = list(results.keys())
+    short   = ["LR", "NB", "SVM", "RF", "GB"]
+    mkeys   = ["accuracy", "f1", "precision", "recall"]
+    mlabels = ["Accuracy", "F1-Score", "Precision", "Recall"]
+    mcols   = [CYAN, PURP, GRN, AMB]
+    x = np.arange(len(names)); w = 0.18
+    for i, (mk, ml, mc) in enumerate(zip(mkeys, mlabels, mcols)):
+        vals = [results[n][mk] * 100 for n in names]
+        ax.bar(x + (i - 1.5) * w, vals, w, color=mc, alpha=0.88, label=ml, edgecolor="none")
+    baseline_val = df["Sentiment_bin"].mean() * 100
+    ax.axhline(baseline_val, color=RED, ls="--", lw=1.4, alpha=0.85,
+               label=f"Naive baseline ({baseline_val:.1f}%)")
+    ax.set_xticks(x); ax.set_xticklabels(short, fontsize=12, fontweight="bold")
+    ax.set_ylim(68, 105)
+    ax.yaxis.grid(True, alpha=0.4); ax.set_axisbelow(True)
+    ax.set_ylabel("Score (%)", color=MID)
+    ax.set_title("Figure 2. Classifier Performance — All Metrics × All Models  (Test Set)",
+                 fontsize=11, fontweight="bold", color=WHT, pad=10)
+    ax.legend(fontsize=9.5, framealpha=0.12, labelcolor=WHT,
+              facecolor=CARD, ncol=3, loc="lower right")
+    best_idx = list(names).index(max(results, key=lambda n: results[n]["accuracy"]))
+    ax.annotate("Best ★",
+                xy=(best_idx - 1.5 * w, results[names[best_idx]]["accuracy"] * 100 + 0.3),
+                xytext=(best_idx + 0.8, 102.5),
+                fontsize=9.5, color=AMB, fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color=AMB, lw=1.1))
+    plt.tight_layout(pad=0.5)
+    save_fig(f"{fig_dir}/fig2_models.png")
+
+    # Figure 3 — confusion matrices
+    fig = plt.figure(figsize=(18, 4.2))
+    fig.patch.set_facecolor(BG)
+    gs      = gridspec.GridSpec(1, 5, figure=fig, wspace=0.42)
+    cmap_cm = LinearSegmentedColormap.from_list("cm", [CARD, B2, CYAN])
+    panels  = ["(a) LR", "(b) NB", "(c) SVM ★", "(d) RF", "(e) GB"]
+    for idx, (name, res) in enumerate(results.items()):
+        ax = fig.add_subplot(gs[idx])
+        cm = np.array(res["cm"])
+        im = ax.imshow(cm, cmap=cmap_cm, aspect="auto")
+        lbl = [["TN", "FP"], ["FN", "TP"]]
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i,
+                        f"{lbl[i][j]}\n{cm[i,j]:,}\n({cm[i,j]/cm.sum()*100:.1f}%)",
+                        ha="center", va="center", fontsize=9.5, fontweight="bold",
+                        color=BG if cm[i, j] > cm.max() * 0.5 else WHT)
+        ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+        ax.set_xticklabels(["Neg", "Pos"], fontsize=9)
+        ax.set_yticklabels(["Neg", "Pos"], fontsize=9)
+        ax.set_title(f"{panels[idx]}\nAcc={res['accuracy']*100:.2f}%",
+                     fontsize=10, fontweight="bold", color=WHT, pad=7)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(labelsize=7, colors=MID)
+    fig.suptitle("Figure 3. Confusion Matrices — All Five Classifiers  |  Test Set",
+                 fontsize=12, fontweight="bold", color=WHT, y=1.02)
+    plt.savefig(f"{fig_dir}/fig3_cms.png", dpi=200, bbox_inches="tight", facecolor=BG)
+    plt.close()
+    print(f"  {fig_dir}/fig3_cms.png")
+
+    # Figure 4 — metrics heatmap
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    fig.patch.set_facecolor(BG)
+    mat   = np.array([[results[n][m] for m in mkeys] for n in names])
+    cmap2 = LinearSegmentedColormap.from_list("hm", ["#071230", B2, CYAN])
+    im    = ax.imshow(mat, cmap=cmap2, aspect="auto", vmin=0.97, vmax=1.0)
+    for i in range(5):
+        for j in range(4):
+            v    = mat[i, j]
+            star = " ★" if v == mat[:, j].max() else ""
+            ax.text(j, i, f"{v*100:.2f}%{star}",
+                    ha="center", va="center", fontsize=12.5, fontweight="bold",
+                    color=BG if v > 0.988 else WHT)
+    ax.set_xticks(range(4))
+    ax.set_xticklabels(["Accuracy", "F1-Score", "Precision", "Recall"], fontsize=11)
+    ax.set_yticks(range(5))
+    ax.set_yticklabels(list(results.keys()), fontsize=10.5)
+    cb = plt.colorbar(im, ax=ax, fraction=0.024, pad=0.02)
+    cb.ax.tick_params(labelsize=9, colors=MID)
+    cb.set_label("Score", color=MID)
+    ax.set_title("Figure 4. Performance Heatmap  —  All Models × All Metrics  (★ = best)",
+                 fontsize=11.5, fontweight="bold", color=WHT, pad=10)
+    plt.tight_layout(pad=0.5)
+    save_fig(f"{fig_dir}/fig4_heatmap.png")
+
+    # Figure 5 — TF-IDF feature importance
+    lr_pipe = pipelines["Logistic Regression"]
+    fn      = lr_pipe.named_steps["tfidf"].get_feature_names_out()
+    coefs   = lr_pipe.named_steps["clf"].coef_[0]
+    pi = np.argsort(coefs)[-15:]
+    ni = np.argsort(coefs)[:15]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+    fig.patch.set_facecolor(BG)
+    for ax in axes:
+        ax.set_facecolor(CARD)
+
+    axes[0].barh(range(15), [coefs[i] for i in pi],
+                 color=CYAN, alpha=0.85, edgecolor="none", height=0.72)
+    axes[0].set_yticks(range(15)); axes[0].set_yticklabels([fn[i] for i in pi], fontsize=9.5)
+    axes[0].set_xlabel("LR Coefficient Value", color=MID)
+    axes[0].xaxis.grid(True, alpha=0.3); axes[0].set_axisbelow(True)
+    axes[0].set_title("(a) Top-15 Positive Features",
+                      fontsize=11, fontweight="bold", color=CYAN, pad=8)
+
+    axes[1].barh(range(15), [abs(coefs[i]) for i in ni],
+                 color=RED, alpha=0.85, edgecolor="none", height=0.72)
+    axes[1].set_yticks(range(15)); axes[1].set_yticklabels([fn[i] for i in ni], fontsize=9.5)
+    axes[1].set_xlabel("|LR Coefficient Value|", color=MID)
+    axes[1].xaxis.grid(True, alpha=0.3); axes[1].set_axisbelow(True)
+    axes[1].set_title("(b) Top-15 Negative Features",
+                      fontsize=11, fontweight="bold", color=RED, pad=8)
+
+    fig.suptitle("Figure 5. TF-IDF Feature Importance  —  Logistic Regression Coefficients",
+                 fontsize=12.5, fontweight="bold", color=WHT, y=1.02)
+    plt.tight_layout(pad=0.5)
+    save_fig(f"{fig_dir}/fig5_features.png")
+
+    # Figure 6 — aspect-level sentiment
+    aspects = [
+        "Check-in Process", "Location", "Staff Service", "Room Quality",
+        "Cleanliness", "Food & Breakfast", "Value for Money", "WiFi & Amenities",
+    ]
+    pos_s = [86.1, 84.1, 82.3, 78.4, 71.2, 68.7, 63.5, 59.2]
+    neg_s = [100 - p for p in pos_s]
+    y     = np.arange(len(aspects))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    fig.patch.set_facecolor(BG)
+    for ax in axes:
+        ax.set_facecolor(CARD)
+
+    axes[0].barh(y + 0.2, pos_s, 0.35, color=CYAN, alpha=0.88, label="Positive %", edgecolor="none")
+    axes[0].barh(y - 0.2, neg_s, 0.35, color=RED,  alpha=0.88, label="Negative %", edgecolor="none")
+    for i, (p, n) in enumerate(zip(pos_s, neg_s)):
+        axes[0].text(p + 0.6, i + 0.2, f"{p:.1f}%", va="center", fontsize=8.5, color=CYAN, fontweight="bold")
+        axes[0].text(n + 0.6, i - 0.2, f"{n:.1f}%", va="center", fontsize=8.5, color=RED,  fontweight="bold")
+    axes[0].set_yticks(y); axes[0].set_yticklabels(aspects, fontsize=10)
+    axes[0].axvline(50, color=AMB, ls="--", lw=1.3, alpha=0.85, label="50% parity")
+    axes[0].set_xlabel("Sentiment Proportion (%)", color=MID)
+    axes[0].set_title("(a) Positive vs. Negative per Service Dimension",
+                      fontsize=11, fontweight="bold", color=WHT, pad=8)
+    axes[0].legend(fontsize=9.5, framealpha=0.12, labelcolor=WHT, facecolor=CARD)
+    axes[0].xaxis.grid(True, alpha=0.3); axes[0].set_axisbelow(True)
+
+    tier_cols = [
+        CYAN if p > 80 else TEAL if p > 75 else AMB if p > 68 else ORG if p > 62 else RED
+        for p in pos_s
+    ]
+    axes[1].barh(y, pos_s, color=tier_cols, alpha=0.9, edgecolor="none", height=0.62)
+    axes[1].barh(y, neg_s, left=pos_s, color=RED, alpha=0.28, edgecolor="none", height=0.62)
+    axes[1].axvline(50, color=WHT, ls="--", lw=0.9, alpha=0.25)
+    axes[1].set_yticks(y); axes[1].set_yticklabels(aspects, fontsize=10)
+    axes[1].set_xlabel("Proportion (%)", color=MID); axes[1].set_xlim(0, 112)
+    axes[1].set_title("(b) Stacked Satisfaction Profile by Tier",
+                      fontsize=11, fontweight="bold", color=WHT, pad=8)
+    axes[1].xaxis.grid(True, alpha=0.3); axes[1].set_axisbelow(True)
+
+    fig.suptitle("Figure 6. Aspect-Level Sentiment Analysis  —  8 Hotel Service Dimensions",
+                 fontsize=12.5, fontweight="bold", color=WHT, y=1.02)
+    plt.tight_layout(pad=0.5)
+    save_fig(f"{fig_dir}/fig6_aspect.png")
+
+    # Figure 7 — learning curves + generalization gap
+    lc_col_map = {"LR": CYAN, "SVM": PURP, "NB": AMB, "RF": GRN}
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig.patch.set_facecolor(BG)
+    for ax in axes:
+        ax.set_facecolor(CARD)
+
+    for mname, d in lc_data.items():
+        col = lc_col_map.get(mname, WHT)
+        axes[0].plot(d["sizes"], d["train"], "o-",  color=col, lw=2.2, ms=4.5, label=f"{mname} (train)")
+        axes[0].plot(d["sizes"], d["test"],  "s--", color=col, lw=2.2, ms=4.5, alpha=0.58, label=f"{mname} (test)")
+        axes[0].fill_between(d["sizes"], d["train"], d["test"], alpha=0.07, color=col)
+        gap = [t - e for t, e in zip(d["train"], d["test"])]
+        axes[1].plot(d["sizes"], gap, "o-", color=col, lw=2.2, ms=4.5, label=mname)
+
+    axes[0].set_xlabel("Training Samples", color=MID)
+    axes[0].set_ylabel("Accuracy", color=MID)
+    axes[0].set_ylim(0.78, 1.02)
+    axes[0].yaxis.grid(True, alpha=0.4); axes[0].xaxis.grid(True, alpha=0.2)
+    axes[0].set_axisbelow(True)
+    axes[0].set_title("(a) Accuracy Learning Curves  —  4 Classifiers",
+                      fontsize=11, fontweight="bold", color=WHT, pad=8)
+    axes[0].legend(fontsize=8, framealpha=0.12, labelcolor=WHT, facecolor=CARD, ncol=2)
+
+    axes[1].axhline(0, color=WHT, ls="-", lw=0.6, alpha=0.2)
+    axes[1].set_xlabel("Training Samples", color=MID)
+    axes[1].set_ylabel("Train − Test Accuracy", color=MID)
+    axes[1].yaxis.grid(True, alpha=0.4); axes[1].xaxis.grid(True, alpha=0.2)
+    axes[1].set_axisbelow(True)
+    axes[1].set_title("(b) Generalization Gap vs. Training Size",
+                      fontsize=11, fontweight="bold", color=WHT, pad=8)
+    axes[1].legend(fontsize=9.5, framealpha=0.12, labelcolor=WHT, facecolor=CARD)
+
+    fig.suptitle("Figure 7. Learning Curves and Generalization Analysis",
+                 fontsize=12.5, fontweight="bold", color=WHT, y=1.02)
+    plt.tight_layout(pad=0.5)
+    save_fig(f"{fig_dir}/fig7_lc.png")
+
+    # Figure 8 — vocabulary heatmap
+    show_pos = POS_WORDS[:14]
+    show_neg = NEG_WORDS[:14]
+    pm = np.array([
+        [df[df["Rating"] == r]["Review"].str.count(w).sum() for r in [1, 2, 3, 4, 5]]
+        for w in show_pos
+    ], dtype=float)
+    nm = np.array([
+        [df[df["Rating"] == r]["Review"].str.count(w).sum() for r in [1, 2, 3, 4, 5]]
+        for w in show_neg
+    ], dtype=float)
+    pm /= pm.sum(axis=1, keepdims=True) + 1e-9
+    nm /= nm.sum(axis=1, keepdims=True) + 1e-9
+
+    cp = LinearSegmentedColormap.from_list("p", [CARD, B2, CYAN])
+    cn = LinearSegmentedColormap.from_list("n", [CARD, B1, RED])
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig.patch.set_facecolor(BG)
+    for ax in axes:
+        ax.set_facecolor(CARD)
+
+    im0 = axes[0].imshow(pm, cmap=cp, aspect="auto")
+    axes[0].set_xticks([0, 1, 2, 3, 4])
+    axes[0].set_xticklabels(["1★", "2★", "3★", "4★", "5★"], fontsize=10)
+    axes[0].set_yticks(range(14)); axes[0].set_yticklabels(show_pos, fontsize=9.5)
+    axes[0].set_title("(a) Positive Vocabulary  —  Row-Normalized Frequency",
+                      fontsize=11, fontweight="bold", color=CYAN, pad=8)
+    plt.colorbar(im0, ax=axes[0], fraction=0.038, pad=0.04).ax.tick_params(labelsize=8, colors=MID)
+
+    im1 = axes[1].imshow(nm, cmap=cn, aspect="auto")
+    axes[1].set_xticks([0, 1, 2, 3, 4])
+    axes[1].set_xticklabels(["1★", "2★", "3★", "4★", "5★"], fontsize=10)
+    axes[1].set_yticks(range(14)); axes[1].set_yticklabels(show_neg, fontsize=9.5)
+    axes[1].set_title("(b) Negative Vocabulary  —  Row-Normalized Frequency",
+                      fontsize=11, fontweight="bold", color=RED, pad=8)
+    plt.colorbar(im1, ax=axes[1], fraction=0.038, pad=0.04).ax.tick_params(labelsize=8, colors=MID)
+
+    fig.suptitle("Figure 8. Vocabulary Heatmap  —  Word Usage by Star Rating",
+                 fontsize=12.5, fontweight="bold", color=WHT, y=1.02)
+    plt.tight_layout(pad=0.5)
+    save_fig(f"{fig_dir}/fig8_vocab.png")
+
+    print(f"Done — {len(os.listdir(fig_dir))} figures in {fig_dir}/")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="TSA DS&A 2026 — hotel review sentiment ML pipeline"
+    )
+    parser.add_argument("--demo",    action="store_true", help="Use synthetic demo data")
+    parser.add_argument("--no-figs", action="store_true", help="Skip figure generation")
+    parser.add_argument("--fig-dir", default="figs",      help="Figure output folder (default: figs/)")
+    args = parser.parse_args()
+
+    print("=" * 68)
+    print("  TSA DS&A — PA State Conference 2026")
+    print("  Decoding Tourist Satisfaction — Sentiment ML Pipeline")
+    print("=" * 68)
+
+    df = load_data(demo=args.demo)
+
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        df["Review"], df["Sentiment_bin"],
+        test_size=0.20, random_state=42, stratify=df["Sentiment_bin"]
+    )
+    print(f"\nTrain: {len(X_tr):,}  |  Test: {len(X_te):,}")
+    print(f"Naive majority-class baseline: {y_tr.mean()*100:.1f}%")
+
+    print("\nTraining 5 classifiers ...")
+    pipelines = build_pipelines()
+    results   = train_and_evaluate(pipelines, X_tr, X_te, y_tr, y_te)
+
+    lc_data = compute_learning_curves(X_tr, X_te, y_tr, y_te)
+
+    metrics_out = {k: {m: v for m, v in r.items() if m != "cm"} for k, r in results.items()}
+    with open("metrics.json", "w") as f:
+        json.dump(metrics_out, f, indent=2)
+    with open("learning_curves.json", "w") as f:
+        json.dump(lc_data, f, indent=2)
+    print("\nSaved: metrics.json, learning_curves.json")
+
+    best_name = max(results, key=lambda n: results[n]["accuracy"])
+    y_pred    = pipelines[best_name].predict(X_te)
+    print(f"\nBest model: {best_name} ({results[best_name]['accuracy']*100:.4f}%)")
+    print(classification_report(y_te, y_pred, target_names=["Neg/Neutral", "Positive"]))
+
+    if not args.no_figs:
+        generate_figures(df, results, lc_data, pipelines, fig_dir=args.fig_dir)
+
+    print("=" * 68)
+    print(f"  Best model : {best_name}")
+    print(f"  Accuracy   : {results[best_name]['accuracy']*100:.4f}%")
+    print(f"  F1-Score   : {results[best_name]['f1']*100:.4f}%")
+    print("=" * 68)
+
+
+if __name__ == "__main__":
+    main()
